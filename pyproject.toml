@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rss-reader"
+version = "0.1.0"
+description = "A CLI-based RSS feed aggregator and reader"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "feedparser>=6.0",
+    "httpx>=0.25",
+    "textual>=0.40",
+]
+
+[project.scripts]
+rss = "rss_reader.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["rss_reader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

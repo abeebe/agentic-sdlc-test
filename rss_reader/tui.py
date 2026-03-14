@@ -1,5 +1,7 @@
+import webbrowser
 from typing import Optional
 
+from bs4 import BeautifulSoup
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -15,6 +17,7 @@ from textual.widgets import (
     Static,
 )
 
+from rss_reader.discovery import DiscoveredFeed, resolve_feed_url
 from rss_reader.feed import FeedError, entries_to_articles, fetch_and_parse
 from rss_reader.models import Article
 from rss_reader.storage import Storage
@@ -23,8 +26,108 @@ FILTER_ALL = "all"
 FILTER_FAVORITES = "favorites"
 
 
+# --- Article HTML link parsing ---
+
+
+def parse_article_links(html: str) -> list[tuple[str, str]]:
+    """Parse article HTML and extract (text, url) pairs for links.
+
+    Returns a list of (display_text, href) tuples.
+    """
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    links = []
+    for a in soup.find_all("a"):
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        text = a.get_text(strip=True) or href
+        links.append((text, href))
+    return links
+
+
+def html_to_text(html: str) -> str:
+    """Convert article HTML to plain text, preserving basic structure."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.get_text(separator="\n", strip=True)
+    except Exception:
+        return html
+
+
+# --- Feed selection modal ---
+
+
+class FeedSelectScreen(ModalScreen[Optional[DiscoveredFeed]]):
+    """Modal screen for selecting from multiple discovered feeds."""
+
+    CSS = """
+    FeedSelectScreen {
+        align: center middle;
+    }
+    #feed-select-dialog {
+        width: 70;
+        height: auto;
+        max-height: 20;
+        border: thick $surface-lighten-2;
+        background: $surface;
+        padding: 1 2;
+    }
+    #feed-select-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #feed-select-list {
+        height: auto;
+        max-height: 12;
+    }
+    #feed-select-hint {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, feeds: list[DiscoveredFeed]):
+        super().__init__()
+        self.feeds = feeds
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="feed-select-dialog"):
+            yield Label("Multiple feeds found — select one:", id="feed-select-title")
+            yield ListView(id="feed-select-list")
+            yield Label("Enter to select, Escape to cancel", id="feed-select-hint")
+
+    def on_mount(self):
+        feed_list = self.query_one("#feed-select-list", ListView)
+        for feed in self.feeds:
+            type_label = f"[{feed.feed_type.upper()}]"
+            feed_list.append(
+                ListItem(Label(f"{type_label} {feed.title}\n    {feed.url}"))
+            )
+        feed_list.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected):
+        feed_list = self.query_one("#feed-select-list", ListView)
+        idx = feed_list.index
+        if idx is not None and 0 <= idx < len(self.feeds):
+            self.dismiss(self.feeds[idx])
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+# --- Add feed modal with discovery ---
+
+
 class AddFeedScreen(ModalScreen[Optional[str]]):
-    """Modal screen for adding a feed URL."""
+    """Modal screen for adding a feed URL with auto-discovery."""
 
     CSS = """
     AddFeedScreen {
@@ -61,7 +164,9 @@ class AddFeedScreen(ModalScreen[Optional[str]]):
     def compose(self) -> ComposeResult:
         with Vertical(id="add-feed-dialog"):
             yield Label("Add Feed", id="add-feed-title")
-            yield Input(placeholder="Enter feed URL...", id="add-feed-input")
+            yield Input(
+                placeholder="Enter website or feed URL...", id="add-feed-input"
+            )
             yield Label("Enter to submit, Escape to cancel", id="add-feed-hint")
 
     def on_mount(self):
@@ -72,26 +177,105 @@ class AddFeedScreen(ModalScreen[Optional[str]]):
         if not url:
             self.dismiss(None)
             return
-        try:
-            feed_info, _ = fetch_and_parse(url)
-            if self.storage.feed_url_exists(url):
-                self.query_one("#add-feed-hint", Label).update(
-                    f"Error: Already subscribed to {url}"
-                )
+
+        hint = self.query_one("#add-feed-hint", Label)
+        hint.update("Discovering feed...")
+
+        result = resolve_feed_url(url)
+
+        if isinstance(result, tuple):
+            # Direct feed URL
+            feed_url, feed_info, _ = result
+            if self.storage.feed_url_exists(feed_url):
+                hint.update(f"Error: Already subscribed to {feed_url}")
                 return
             self.storage.add_feed(
-                title=feed_info["title"], url=url, link=feed_info.get("link", "")
+                title=feed_info["title"],
+                url=feed_url,
+                link=feed_info.get("link", ""),
             )
             self.dismiss(feed_info["title"])
+        elif isinstance(result, list) and len(result) == 1:
+            # Single discovered feed
+            feed = result[0]
+            self._add_discovered_feed(feed)
+        elif isinstance(result, list) and len(result) > 1:
+            # Multiple feeds — show selection
+            self.app.push_screen(
+                FeedSelectScreen(result), self._on_feed_selected
+            )
+        else:
+            hint.update(
+                f"No RSS or Atom feeds found at {url}. Try a direct feed URL."
+            )
+
+    def _on_feed_selected(self, feed: Optional[DiscoveredFeed]) -> None:
+        if feed is None:
+            self.query_one("#add-feed-hint", Label).update(
+                "Selection cancelled. Enter another URL or press Escape."
+            )
+            return
+        self._add_discovered_feed(feed)
+
+    def _add_discovered_feed(self, feed: DiscoveredFeed):
+        hint = self.query_one("#add-feed-hint", Label)
+        if self.storage.feed_url_exists(feed.url):
+            hint.update(f"Error: Already subscribed to {feed.url}")
+            return
+        try:
+            feed_info, _ = fetch_and_parse(feed.url)
+            title = feed_info.get("title", feed.title)
+            self.storage.add_feed(
+                title=title, url=feed.url, link=feed_info.get("link", "")
+            )
+            self.dismiss(title)
         except FeedError as e:
-            self.query_one("#add-feed-hint", Label).update(f"Error: {e}")
+            hint.update(f"Error: {e}")
 
     def action_cancel(self):
         self.dismiss(None)
 
 
+# --- Article detail with active links ---
+
+
+class ArticleLink(Static):
+    """A clickable link widget within article content."""
+
+    CSS = """
+    ArticleLink {
+        color: $accent;
+        text-style: underline;
+        width: auto;
+        height: auto;
+    }
+    ArticleLink:focus {
+        color: $text;
+        background: $accent;
+        text-style: bold underline;
+    }
+    """
+
+    can_focus = True
+
+    def __init__(self, text: str, url: str, **kwargs):
+        super().__init__(text, **kwargs)
+        self.url = url
+
+    def on_key(self, event) -> None:
+        if event.key in ("enter", "space"):
+            webbrowser.open(self.url)
+            event.stop()
+            event.prevent_default()
+
+
 class ArticleDetail(VerticalScroll):
-    """Displays a single article's content."""
+    """Displays a single article's content with interactive links."""
+
+    BINDINGS = [
+        Binding("tab", "next_link", "Next Link", show=False),
+        Binding("shift+tab", "prev_link", "Prev Link", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         yield Label("Select an article to read", id="article-title")
@@ -108,13 +292,54 @@ class ArticleDetail(VerticalScroll):
         if article.published:
             meta_parts.append(article.published.strftime("%Y-%m-%d %H:%M"))
         self.query_one("#article-meta", Label).update(" | ".join(meta_parts))
-        self.query_one("#article-body", Static).update(article.summary or "(no content)")
+
+        # Remove old link widgets
+        for link_widget in self.query(ArticleLink):
+            link_widget.remove()
+
+        content = article.summary or "(no content)"
+        links = parse_article_links(content)
+        plain_text = html_to_text(content)
+
+        self.query_one("#article-body", Static).update(plain_text)
+
+        # Add link widgets below the body
+        if links:
+            for i, (text, url) in enumerate(links):
+                self.mount(ArticleLink(f"[{i + 1}] {text} ({url})", url))
+
         self.scroll_home(animate=False)
 
     def clear_detail(self):
         self.query_one("#article-title", Label).update("Select an article to read")
         self.query_one("#article-meta", Label).update("")
         self.query_one("#article-body", Static).update("")
+        for link_widget in self.query(ArticleLink):
+            link_widget.remove()
+
+    def action_next_link(self):
+        links = list(self.query(ArticleLink))
+        if not links:
+            return
+        focused = self.app.focused
+        if focused in links:
+            idx = links.index(focused)
+            next_idx = (idx + 1) % len(links)
+        else:
+            next_idx = 0
+        links[next_idx].focus()
+
+    def action_prev_link(self):
+        links = list(self.query(ArticleLink))
+        if not links:
+            return
+        focused = self.app.focused
+        if focused in links:
+            idx = links.index(focused)
+            prev_idx = (idx - 1) % len(links)
+        else:
+            prev_idx = len(links) - 1
+        links[prev_idx].focus()
 
 
 class RSSReaderApp(App):
@@ -210,10 +435,10 @@ class RSSReaderApp(App):
         self._rebuild_feed_list()
         table = self.query_one("#article-list-pane", DataTable)
         table.cursor_type = "row"
-        table.add_columns("", "★", "Feed", "Title", "Date")
+        table.add_columns("", "\u2605", "Feed", "Title", "Date")
         self._refresh_articles()
 
-        # If a feed_filter was passed from CLI, select it in the feed list
+        # If a feed_filter was passed, select it in the feed list
         if self.feed_filter is not None:
             feed_list = self.query_one("#feed-list", ListView)
             for i, filter_val in enumerate(self._feed_list_map):
@@ -227,7 +452,7 @@ class RSSReaderApp(App):
         feed_list = self.query_one("#feed-list", ListView)
         self._feed_list_map = [FILTER_ALL, FILTER_FAVORITES]
         feed_list.append(ListItem(Label("All Feeds")))
-        feed_list.append(ListItem(Label("★ Favorites")))
+        feed_list.append(ListItem(Label("\u2605 Favorites")))
         for feed in self.feeds:
             self._feed_list_map.append(feed.id)
             feed_list.append(ListItem(Label(f"{feed.title} ({feed.unread_count})")))
@@ -239,7 +464,7 @@ class RSSReaderApp(App):
         await feed_list.clear()
         self._feed_list_map = [FILTER_ALL, FILTER_FAVORITES]
         feed_list.append(ListItem(Label("All Feeds")))
-        feed_list.append(ListItem(Label("★ Favorites")))
+        feed_list.append(ListItem(Label("\u2605 Favorites")))
         for feed in self.feeds:
             self._feed_list_map.append(feed.id)
             feed_list.append(ListItem(Label(f"{feed.title} ({feed.unread_count})")))
@@ -270,8 +495,8 @@ class RSSReaderApp(App):
             return
 
         for article in self.articles:
-            unread = "●" if not article.is_read else " "
-            star = "★" if article.is_favorite else " "
+            unread = "\u25cf" if not article.is_read else " "
+            star = "\u2605" if article.is_favorite else " "
             date_str = (
                 article.published.strftime("%Y-%m-%d")
                 if article.published

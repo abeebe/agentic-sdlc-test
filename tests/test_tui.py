@@ -314,12 +314,16 @@ class TestInAppAddFeed:
         """Submitting a valid URL should add the feed."""
         feed_info = {"title": "New Feed", "link": "https://new.com"}
         entries = []
+        # resolve_feed_url returns a tuple for direct feed URLs
         app = RSSReaderApp(storage=storage)
         async with app.run_test() as pilot:
             table = app.query_one(DataTable)
             table.focus()
             await pilot.pause()
-            with patch("rss_reader.tui.fetch_and_parse", return_value=(feed_info, entries)):
+            with patch(
+                "rss_reader.tui.resolve_feed_url",
+                return_value=("https://new.com/feed.xml", feed_info, entries),
+            ):
                 await pilot.press("a")
                 await pilot.pause()
                 modal_input = app.screen.query_one("#add-feed-input", Input)

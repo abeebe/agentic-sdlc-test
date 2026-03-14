@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rss-reader"
 version = "0.1.0"
-description = "A CLI-based RSS feed aggregator and reader"
+description = "A TUI-based RSS feed aggregator and reader"
 requires-python = ">=3.10"
 dependencies = [
-    "click>=8.1",
+    "beautifulsoup4>=4.12",
     "feedparser>=6.0",
     "httpx>=0.25",
     "textual>=0.40",
